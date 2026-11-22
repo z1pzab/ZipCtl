@@ -7,10 +7,12 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::app::{
-    ActiveTab, ApiConfigModal, App, HandoffModal, Modal, NetlifyConfigModal, VibeSection,
+    ActiveTab, ApiConfigModal, App, HandoffModal, Modal, NetlifyConfigModal, OpsSection,
+    VibeSection,
 };
-use crate::harnesses::HarnessKind;
-use crate::sys::{format_bytes, format_gb, format_rate, DiskStatus};
+use zipctl::harnesses::HarnessKind;
+use zipctl::services::ServiceState;
+use zipctl::sys::{format_bytes, format_gb, format_rate, DiskStatus};
 
 const BG_ACCENT: Color = Color::Rgb(30, 30, 46);
 const FG_MAIN: Color = Color::Rgb(205, 214, 244);

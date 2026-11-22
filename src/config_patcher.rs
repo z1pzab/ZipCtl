@@ -171,6 +171,10 @@ pub struct HarnessSavedConfig {
 pub struct ZipCtlConfig {
     #[serde(default = "default_low_space_gb")]
     pub low_space_gb: u64,
+    #[serde(default = "default_projects_dir")]
+    pub projects_dir: String,
+    #[serde(default = "default_services_list")]
+    pub services: Vec<String>,
     #[serde(default)]
     pub netlify_ai: NetlifyAiConfig,
     #[serde(default)]
@@ -181,10 +185,20 @@ fn default_low_space_gb() -> u64 {
     5
 }
 
+fn default_projects_dir() -> String {
+    "/mnt/hdd/кодинг".to_string()
+}
+
+fn default_services_list() -> Vec<String> {
+    crate::services::default_services()
+}
+
 impl Default for ZipCtlConfig {
     fn default() -> Self {
         Self {
             low_space_gb: default_low_space_gb(),
+            projects_dir: default_projects_dir(),
+            services: default_services_list(),
             netlify_ai: NetlifyAiConfig::default(),
             harnesses: BTreeMap::new(),
         }

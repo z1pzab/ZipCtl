@@ -2,26 +2,36 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 use ratatui::widgets::{ListState, TableState};
 
-use crate::config_patcher::{
+use zipctl::api_tester::{test_api_connection, ApiTestResult};
+use zipctl::config_patcher::{
     load_or_create_config, patch_harness_config, save_config, HarnessSavedConfig, ProviderPreset,
     ZipCtlConfig,
 };
-use crate::harnesses::{
+use zipctl::git_radar::{quick_commit_and_push, scan_projects, RepoStatus};
+use zipctl::harnesses::{
     default_harnesses, default_web_chats, launch_netlify_ai, launch_or_install_harness,
     open_url_xdg, refresh_installed_flags, HandoffNote, HarnessDef, HarnessKind, WebChatDef,
 };
-use crate::sys::{trigger_cache_cleanup, SysMonitor};
+use zipctl::services::{refresh_services, restart_service, toggle_service, ServiceStatus};
+use zipctl::sys::{trigger_cache_cleanup, SysMonitor};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveTab {
     System,
     VibeCode,
+    GitServices,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VibeSection {
     Harnesses,
     WebChats,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpsSection {
+    Git,
+    Services,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +45,7 @@ pub struct ApiConfigModal {
     pub api_key: String,
     pub show_key: bool,
     pub active_field: usize, // 0: Provider, 1: Base URL, 2: Model, 3: API Key
+    pub test_result: Option<ApiTestResult>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,20 +74,28 @@ pub struct LayoutAreas {
     pub process_table_area: Rect,
     pub harnesses_area: Rect,
     pub webchats_area: Rect,
+    pub git_area: Rect,
+    pub services_area: Rect,
 }
 
 pub struct App {
     pub should_quit: bool,
     pub active_tab: ActiveTab,
     pub vibe_section: VibeSection,
+    pub ops_section: OpsSection,
     pub config: ZipCtlConfig,
     pub sys: SysMonitor,
     pub harnesses: Vec<HarnessDef>,
     pub web_chats: Vec<WebChatDef>,
+    pub repos: Vec<RepoStatus>,
+    pub repos_error: Option<String>,
+    pub services: Vec<ServiceStatus>,
 
     pub process_state: TableState,
     pub harness_state: ListState,
     pub webchat_state: ListState,
+    pub repo_state: ListState,
+    pub service_state: ListState,
 
     pub modal: Modal,
     pub status_msg: String,
@@ -90,6 +109,11 @@ impl App {
         let sys = SysMonitor::new(config.low_space_gb);
         let harnesses = default_harnesses();
         let web_chats = default_web_chats();
+        let (repos, repos_error) = match scan_projects(&config.projects_dir) {
+            Ok(list) => (list, None),
+            Err(err) => (Vec::new(), Some(err)),
+        };
+        let services = refresh_services(&config.services);
 
         let mut process_state = TableState::default();
         if !sys.processes.is_empty() {
@@ -102,19 +126,35 @@ impl App {
         let mut webchat_state = ListState::default();
         webchat_state.select(Some(0));
 
+        let mut repo_state = ListState::default();
+        if !repos.is_empty() {
+            repo_state.select(Some(0));
+        }
+
+        let mut service_state = ListState::default();
+        if !services.is_empty() {
+            service_state.select(Some(0));
+        }
+
         Self {
             should_quit: false,
             active_tab: ActiveTab::System,
             vibe_section: VibeSection::Harnesses,
+            ops_section: OpsSection::Git,
             config,
             sys,
             harnesses,
             web_chats,
+            repos,
+            repos_error,
+            services,
             process_state,
             harness_state,
             webchat_state,
+            repo_state,
+            service_state,
             modal: Modal::None,
-            status_msg: "Готово. [Tab] вкладки • [h] Handoff • [c] очистка кэша • [q] выход"
+            status_msg: "Готово. [Tab] вкладки • [h] Handoff • [g] Git Push • [c] кэш • [q] выход"
                 .to_string(),
             status_is_error: false,
             areas: LayoutAreas::default(),
@@ -162,20 +202,27 @@ impl App {
             KeyCode::Tab => {
                 self.active_tab = match self.active_tab {
                     ActiveTab::System => ActiveTab::VibeCode,
-                    ActiveTab::VibeCode => ActiveTab::System,
+                    ActiveTab::VibeCode => ActiveTab::GitServices,
+                    ActiveTab::GitServices => ActiveTab::System,
                 };
             }
             KeyCode::Char('1') => self.active_tab = ActiveTab::System,
             KeyCode::Char('2') => self.active_tab = ActiveTab::VibeCode,
+            KeyCode::Char('3') => self.active_tab = ActiveTab::GitServices,
             KeyCode::Char('h') | KeyCode::Char('р') => self.open_handoff_modal(),
             KeyCode::Char('r') | KeyCode::Char('к') => {
                 self.sys.refresh();
                 refresh_installed_flags(&mut self.harnesses);
-                self.set_status("Данные системы и список харнессов обновлены.".to_string(), false);
+                self.refresh_git_and_services();
+                self.set_status(
+                    "Метрики, харнессы, Git-репозитории и сервисы обновлены.".to_string(),
+                    false,
+                );
             }
             _ => match self.active_tab {
                 ActiveTab::System => self.handle_system_key(key),
                 ActiveTab::VibeCode => self.handle_vibecode_key(key),
+                ActiveTab::GitServices => self.handle_ops_key(key),
             },
         }
     }
@@ -238,6 +285,112 @@ impl App {
         }
     }
 
+    fn handle_ops_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Left => self.ops_section = OpsSection::Git,
+            KeyCode::Right => self.ops_section = OpsSection::Services,
+            KeyCode::Up => match self.ops_section {
+                OpsSection::Git => self.move_repo_selection(-1),
+                OpsSection::Services => self.move_service_selection(-1),
+            },
+            KeyCode::Down => match self.ops_section {
+                OpsSection::Git => self.move_repo_selection(1),
+                OpsSection::Services => self.move_service_selection(1),
+            },
+            KeyCode::Char('g') | KeyCode::Char('п') => {
+                self.trigger_selected_git_push();
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => match self.ops_section {
+                OpsSection::Git => self.trigger_selected_git_push(),
+                OpsSection::Services => self.toggle_selected_service(),
+            },
+            KeyCode::Char('R') | KeyCode::Char('К') => {
+                if self.ops_section == OpsSection::Services {
+                    self.restart_selected_service();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn refresh_git_and_services(&mut self) {
+        match scan_projects(&self.config.projects_dir) {
+            Ok(list) => {
+                self.repos = list;
+                self.repos_error = None;
+                if self.repos.is_empty() {
+                    self.repo_state.select(None);
+                } else if self.repo_state.selected().is_none_or(|i| i >= self.repos.len()) {
+                    self.repo_state.select(Some(0));
+                }
+            }
+            Err(err) => {
+                self.repos.clear();
+                self.repos_error = Some(err);
+                self.repo_state.select(None);
+            }
+        }
+        self.services = refresh_services(&self.config.services);
+        if self.services.is_empty() {
+            self.service_state.select(None);
+        } else if self
+            .service_state
+            .selected()
+            .is_none_or(|i| i >= self.services.len())
+        {
+            self.service_state.select(Some(0));
+        }
+    }
+
+    fn trigger_selected_git_push(&mut self) {
+        let Some(idx) = self.repo_state.selected() else {
+            self.set_status("Нет выбранного Git-репозитория.".to_string(), true);
+            return;
+        };
+        let Some(repo) = self.repos.get(idx).cloned() else {
+            return;
+        };
+        match quick_commit_and_push(&repo, None) {
+            Ok(msg) => {
+                self.refresh_git_and_services();
+                self.set_status(msg, false);
+            }
+            Err(err) => self.set_status(err, true),
+        }
+    }
+
+    fn toggle_selected_service(&mut self) {
+        let Some(idx) = self.service_state.selected() else {
+            return;
+        };
+        let Some(svc) = self.services.get(idx).cloned() else {
+            return;
+        };
+        match toggle_service(&svc.name, svc.state.is_active()) {
+            Ok(msg) => {
+                self.services = refresh_services(&self.config.services);
+                self.set_status(msg, false);
+            }
+            Err(err) => self.set_status(err, true),
+        }
+    }
+
+    fn restart_selected_service(&mut self) {
+        let Some(idx) = self.service_state.selected() else {
+            return;
+        };
+        let Some(svc) = self.services.get(idx).cloned() else {
+            return;
+        };
+        match restart_service(&svc.name) {
+            Ok(msg) => {
+                self.services = refresh_services(&self.config.services);
+                self.set_status(msg, false);
+            }
+            Err(err) => self.set_status(err, true),
+        }
+    }
+
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         if !matches!(self.modal, Modal::None) {
             return;
@@ -249,11 +402,14 @@ impl App {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if point_in_rect(col, row, self.areas.tabs_area) {
-                    let mid = self.areas.tabs_area.x + self.areas.tabs_area.width / 2;
-                    self.active_tab = if col < mid {
+                    let third = (self.areas.tabs_area.width / 3).max(1);
+                    let rel = col.saturating_sub(self.areas.tabs_area.x);
+                    self.active_tab = if rel < third {
                         ActiveTab::System
-                    } else {
+                    } else if rel < third * 2 {
                         ActiveTab::VibeCode
+                    } else {
+                        ActiveTab::GitServices
                     };
                     return;
                 }
@@ -296,6 +452,28 @@ impl App {
                             }
                         }
                     }
+                    ActiveTab::GitServices => {
+                        if point_in_rect(col, row, self.areas.git_area) {
+                            self.ops_section = OpsSection::Git;
+                            let start_y = self.areas.git_area.y + 1;
+                            if row >= start_y {
+                                let idx = (row - start_y) as usize / 2;
+                                if idx < self.repos.len() {
+                                    self.repo_state.select(Some(idx));
+                                }
+                            }
+                        } else if point_in_rect(col, row, self.areas.services_area) {
+                            self.ops_section = OpsSection::Services;
+                            let start_y = self.areas.services_area.y + 1;
+                            if row >= start_y {
+                                let idx = (row - start_y) as usize / 2;
+                                if idx < self.services.len() {
+                                    self.service_state.select(Some(idx));
+                                    self.toggle_selected_service();
+                                }
+                            }
+                        }
+                    }
                 }
             }
             MouseEventKind::Down(MouseButton::Right) => {
@@ -319,12 +497,20 @@ impl App {
                     VibeSection::Harnesses => self.move_harness_selection(-1),
                     VibeSection::WebChats => self.move_webchat_selection(-1),
                 },
+                ActiveTab::GitServices => match self.ops_section {
+                    OpsSection::Git => self.move_repo_selection(-1),
+                    OpsSection::Services => self.move_service_selection(-1),
+                },
             },
             MouseEventKind::ScrollDown => match self.active_tab {
                 ActiveTab::System => self.move_process_selection(2),
                 ActiveTab::VibeCode => match self.vibe_section {
                     VibeSection::Harnesses => self.move_harness_selection(1),
                     VibeSection::WebChats => self.move_webchat_selection(1),
+                },
+                ActiveTab::GitServices => match self.ops_section {
+                    OpsSection::Git => self.move_repo_selection(1),
+                    OpsSection::Services => self.move_service_selection(1),
                 },
             },
             _ => {}
@@ -401,6 +587,7 @@ impl App {
             api_key: String::new(),
             show_key: false,
             active_field: 0,
+            test_result: None,
         });
     }
 
@@ -433,6 +620,12 @@ impl App {
             }
             KeyCode::F(2) => {
                 m.show_key = !m.show_key;
+            }
+            KeyCode::F(5) => {
+                m.test_result = Some(test_api_connection(m.provider, &m.base_url, &m.api_key));
+            }
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                m.test_result = Some(test_api_connection(m.provider, &m.base_url, &m.api_key));
             }
             KeyCode::Left if m.active_field == 0 => {
                 m.provider = m.provider.prev();
@@ -734,6 +927,28 @@ impl App {
         let current = self.webchat_state.selected().unwrap_or(0) as isize;
         let next = (current + delta).rem_euclid(len as isize) as usize;
         self.webchat_state.select(Some(next));
+    }
+
+    fn move_repo_selection(&mut self, delta: isize) {
+        let len = self.repos.len();
+        if len == 0 {
+            self.repo_state.select(None);
+            return;
+        }
+        let current = self.repo_state.selected().unwrap_or(0) as isize;
+        let next = (current + delta).rem_euclid(len as isize) as usize;
+        self.repo_state.select(Some(next));
+    }
+
+    fn move_service_selection(&mut self, delta: isize) {
+        let len = self.services.len();
+        if len == 0 {
+            self.service_state.select(None);
+            return;
+        }
+        let current = self.service_state.selected().unwrap_or(0) as isize;
+        let next = (current + delta).rem_euclid(len as isize) as usize;
+        self.service_state.select(Some(next));
     }
 }
 
