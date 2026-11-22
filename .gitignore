@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+Cargo.lock
+.zipctl_handoff.md
+packaging/pkg/
+packaging/src/
+packaging/*.pkg.tar.*
+packaging/zipctl-*

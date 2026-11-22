@@ -1,0 +1,27 @@
+[package]
+name = "zipctl"
+version = "0.1.0"
+edition = "2021"
+authors = ["z1pzab"]
+description = "Лёгкий (<10 МБ ОЗУ) TUI-центр управления системой и AI-харнессами для Arch Linux / Hyprland / Kitty"
+license = "MIT"
+repository = "https://github.com/z1pzab/ZipCtl"
+readme = "README.md"
+keywords = ["tui", "arch-linux", "hyprland", "sysinfo", "ratatui"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+sysinfo = "0.33"
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
