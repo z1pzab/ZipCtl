@@ -1,7 +1,4 @@
 mod app;
-mod config_patcher;
-mod harnesses;
-mod sys;
 mod ui;
 
 use std::error::Error;
