@@ -1,0 +1,42 @@
+# Maintainer: z1pzab <https://github.com/z1pzab/ZipCtl>
+pkgname=zipctl
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Лёгкий (<10 МБ ОЗУ) TUI-центр управления системой и AI-харнессами для Arch Linux / Hyprland / Kitty"
+arch=('x86_64' 'aarch64')
+url="https://github.com/z1pzab/ZipCtl"
+license=('MIT')
+depends=('gcc-libs')
+makedepends=('cargo')
+optdepends=(
+    'kitty: запуск харнессов и очистки кэша в новых окнах терминала'
+    'wl-clipboard: копирование заметки HANDOFF в буфер Wayland (wl-copy)'
+    'pacman-contrib: очистка кэша пакетов через paccache -rk1'
+    'xdg-utils: открытие веб-чатов и профилей браузера'
+    'yay: автоустановка недостающих AUR-харнессов'
+)
+options=('!lto')
+
+build() {
+    local _src_root="${startdir}/.."
+    if [[ ! -f "${_src_root}/Cargo.toml" ]]; then
+        _src_root="${startdir}"
+    fi
+    cd "${_src_root}"
+    export CARGO_TARGET_DIR="${srcdir}/target"
+    cargo build --release
+}
+
+package() {
+    local _src_root="${startdir}/.."
+    if [[ ! -f "${_src_root}/Cargo.toml" ]]; then
+        _src_root="${startdir}"
+    fi
+    install -Dm755 "${srcdir}/target/release/${pkgname}" "${pkgdir}/usr/bin/${pkgname}"
+    if [[ -f "${_src_root}/README.md" ]]; then
+        install -Dm644 "${_src_root}/README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+    fi
+    if [[ -f "${_src_root}/LICENSE" ]]; then
+        install -Dm644 "${_src_root}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    fi
+}
