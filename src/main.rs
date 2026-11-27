@@ -2,7 +2,8 @@ mod app;
 mod ui;
 
 use std::error::Error;
-use std::io;
+use std::io::{self, Write};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
@@ -13,9 +14,9 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::app::App;
+use crate::app::{App, ForegroundCommand};
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn Error>> {
     install_panic_hook();
 
@@ -41,6 +42,16 @@ async fn run_loop(
     let mut last_tick = tokio::time::Instant::now();
 
     loop {
+        app.drain_bg_events();
+
+        if let Some(fg) = app.take_pending_foreground() {
+            suspend_terminal(terminal)?;
+            let res = run_foreground_command(&fg);
+            resume_terminal(terminal)?;
+            app.on_foreground_finished(&fg, res);
+            continue;
+        }
+
         terminal.draw(|frame| ui::render(frame, app))?;
 
         if app.should_quit {
@@ -52,7 +63,6 @@ async fn run_loop(
             .unwrap_or(Duration::ZERO)
             .min(Duration::from_millis(50));
 
-        // Опрос событий терминала без лишней нагрузки на ЦП
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -73,6 +83,59 @@ async fn run_loop(
     }
 
     Ok(())
+}
+
+fn suspend_terminal(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<(), Box<dyn Error>> {
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+    terminal.backend_mut().flush()?;
+    Ok(())
+}
+
+fn resume_terminal(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<(), Box<dyn Error>> {
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
+    terminal.hide_cursor()?;
+    terminal.clear()?;
+    while event::poll(Duration::ZERO)? {
+        let _ = event::read()?;
+    }
+    Ok(())
+}
+
+fn run_foreground_command(fg: &ForegroundCommand) -> Result<Option<i32>, String> {
+    println!("=== zipctl: {} ===", fg.title);
+    let _ = io::stdout().flush();
+
+    let status = Command::new(&fg.program)
+        .args(&fg.args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("{e}"))?;
+
+    if fg.pause_after {
+        println!("\nКоманда завершена (код: {}). Нажмите Enter для возврата в zipctl...", status.code().unwrap_or(0));
+        let _ = io::stdout().flush();
+        let mut buf = String::new();
+        let _ = io::stdin().read_line(&mut buf);
+    }
+
+    Ok(status.code())
 }
 
 fn restore_terminal(

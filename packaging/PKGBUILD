@@ -1,19 +1,19 @@
 # Maintainer: z1pzab <https://github.com/z1pzab/ZipCtl>
 pkgname=zipctl
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
-pkgdesc="Лёгкий (<10 МБ ОЗУ) TUI-центр управления системой и AI-харнессами для Arch Linux / Hyprland / Kitty"
+pkgdesc="Лёгкий кроссплатформенный TUI-центр управления системой, Git-проектами, сервисами и AI-харнессами"
 arch=('x86_64' 'aarch64')
 url="https://github.com/z1pzab/ZipCtl"
 license=('MIT')
 depends=('gcc-libs')
 makedepends=('cargo')
 optdepends=(
-    'kitty: запуск харнессов и очистки кэша в новых окнах терминала'
     'wl-clipboard: копирование заметки HANDOFF в буфер Wayland (wl-copy)'
-    'pacman-contrib: очистка кэша пакетов через paccache -rk1'
-    'xdg-utils: открытие веб-чатов и профилей браузера'
-    'yay: автоустановка недостающих AUR-харнессов'
+    'xclip: копирование заметки HANDOFF в буфер X11'
+    'pacman-contrib: очистка кэша пакетов Arch через paccache -rk1'
+    'xdg-utils: открытие веб-чатов и каталогов проектов'
+    'yay: установка недостающих AUR-харнессов после подтверждения'
 )
 options=('!lto')
 

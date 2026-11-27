@@ -7,10 +7,12 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::app::{
-    ActiveTab, ApiConfigModal, App, HandoffModal, Modal, NetlifyConfigModal, OpsSection,
-    VibeSection,
+    ActiveTab, ApiConfigModal, App, ConfirmInstallModal, HandoffModal, Modal, NetlifyConfigModal,
+    OpsSection, VibeSection,
 };
+use zipctl::config_patcher::zipctl_config_path;
 use zipctl::harnesses::HarnessKind;
+use zipctl::platform;
 use zipctl::services::ServiceState;
 use zipctl::sys::{format_bytes, format_gb, format_rate, DiskStatus};
 
@@ -39,6 +41,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     match app.active_tab {
         ActiveTab::System => render_system_tab(frame, app, root[1]),
         ActiveTab::VibeCode => render_vibecode_tab(frame, app, root[1]),
+        ActiveTab::GitServices => render_git_services_tab(frame, app, root[1]),
     }
 
     render_footer(frame, app, root[2]);
@@ -48,13 +51,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Modal::ApiConfig(m) => render_api_modal(frame, m),
         Modal::NetlifyConfig(m) => render_netlify_modal(frame, app, m),
         Modal::Handoff(m) => render_handoff_modal(frame, app, m),
+        Modal::ConfirmInstall(m) => render_confirm_install_modal(frame, m),
     }
 }
 
 fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(28), Constraint::Min(30)])
+        .constraints([Constraint::Length(28), Constraint::Min(36)])
         .split(area);
 
     let title = Paragraph::new(Line::from(vec![
@@ -65,7 +69,7 @@ fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
                 .bg(C_MAUVE)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" Arch / Hyprland", Style::default().fg(FG_MUTED)),
+        Span::styled(format!(" {}", platform::os_badge()), Style::default().fg(FG_MUTED)),
     ]))
     .block(
         Block::default()
@@ -76,12 +80,14 @@ fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(title, chunks[0]);
 
     let titles = vec![
-        Line::from(" [1] 󰍛 Система и диски "),
-        Line::from(" [2] 󰚩 VibeCode Хаб "),
+        Line::from(" [1] Система и диски "),
+        Line::from(" [2] VibeCode Хаб "),
+        Line::from(" [3] Git и Сервисы "),
     ];
     let selected = match app.active_tab {
         ActiveTab::System => 0,
         ActiveTab::VibeCode => 1,
+        ActiveTab::GitServices => 2,
     };
 
     let tabs = Tabs::new(titles)
@@ -98,7 +104,7 @@ fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(C_BLUE))
-                .title(" Вкладки (Tab / ЛКМ) "),
+                .title(" Вкладки (Tab / 1-3 / ЛКМ) "),
         );
 
     app.areas.tabs_area = chunks[1];
@@ -106,16 +112,22 @@ fn render_header(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_system_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    let disk_count = app.sys.disks_status.len();
+    let disks_height = match disk_count {
+        0..=3 => 6,
+        4..=6 if area.height >= 26 => 11,
+        _ => (disk_count as u16 + 3).clamp(5, 9),
+    };
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7), // ЦП, ОЗУ, Температуры, Сеть
-            Constraint::Length(6), // Диски (/ и /mnt/hdd) + очистка кэша
-            Constraint::Min(8),    // Интерактивный список процессов
+            Constraint::Length(7),            // ЦП, ОЗУ, Температуры, Сеть
+            Constraint::Length(disks_height), // Динамические диски + очистка кэша
+            Constraint::Min(8),               // Интерактивный список процессов
         ])
         .split(area);
 
-    // Верхний ряд: 3 карточки
     let top_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -129,17 +141,137 @@ fn render_system_tab(frame: &mut Frame, app: &mut App, area: Rect) {
     render_mem_box(frame, app, top_cols[1]);
     render_temp_net_box(frame, app, top_cols[2]);
 
-    // Средний ряд: два выделенных диска
-    let disk_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
-
-    render_disk_box(frame, &app.sys.root_disk, disk_cols[0]);
-    render_disk_box(frame, &app.sys.hdd_disk, disk_cols[1]);
-
-    // Нижний ряд: процессы
+    render_disks_section(frame, app, rows[1]);
     render_process_table(frame, app, rows[2]);
+}
+
+fn render_disks_section(frame: &mut Frame, app: &App, area: Rect) {
+    let disks = &app.sys.disks_status;
+    let low_gb = app.sys.low_space_gb();
+
+    if disks.is_empty() {
+        let empty = Paragraph::new(format!(
+            "Физические диски и разделы не обнаружены. {}",
+            platform::cache_cleanup_hint()
+        ))
+        .style(Style::default().fg(FG_MUTED))
+        .block(
+            Block::default()
+                .title(" Диски ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(FG_MUTED)),
+        );
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    if disks.len() <= 3 {
+        let constraints: Vec<Constraint> = (0..disks.len())
+            .map(|_| Constraint::Ratio(1, disks.len() as u32))
+            .collect();
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(constraints)
+            .split(area);
+        for (disk, rect) in disks.iter().zip(cols.iter()) {
+            render_disk_box(frame, disk, low_gb, *rect);
+        }
+        return;
+    }
+
+    if disks.len() <= 6 && area.height >= 10 {
+        let split_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
+        let first_row_count = disks.len().div_ceil(2);
+        let (row1, row2) = disks.split_at(first_row_count);
+
+        let c1: Vec<Constraint> = (0..row1.len())
+            .map(|_| Constraint::Ratio(1, row1.len() as u32))
+            .collect();
+        let cols1 = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(c1)
+            .split(split_rows[0]);
+        for (disk, rect) in row1.iter().zip(cols1.iter()) {
+            render_disk_box(frame, disk, low_gb, *rect);
+        }
+
+        if !row2.is_empty() {
+            let c2: Vec<Constraint> = (0..row2.len())
+                .map(|_| Constraint::Ratio(1, row2.len() as u32))
+                .collect();
+            let cols2 = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(c2)
+                .split(split_rows[1]);
+            for (disk, rect) in row2.iter().zip(cols2.iter()) {
+                render_disk_box(frame, disk, low_gb, *rect);
+            }
+        }
+        return;
+    }
+
+    // Compact table view when many partitions are mounted
+    let header = Row::new(vec!["Точка монтирования", "Тип / ФС", "Занято / Всего", "Свободно", "Статус"])
+        .style(Style::default().fg(C_MAUVE).add_modifier(Modifier::BOLD));
+
+    let table_rows = disks.iter().map(|d| {
+        let kind_fs = if d.disk_kind.is_empty() {
+            d.fs_type.clone()
+        } else {
+            format!("{} {}", d.disk_kind, d.fs_type)
+        };
+        let status = if d.low_space {
+            format!("⚠ МАЛО (<{low_gb} ГБ)")
+        } else {
+            "OK".to_string()
+        };
+        let style = if d.low_space {
+            Style::default().fg(C_RED)
+        } else {
+            Style::default().fg(FG_MAIN)
+        };
+        Row::new(vec![
+            d.mount_point.clone(),
+            kind_fs,
+            format!(
+                "{} / {} ({:.0}%)",
+                format_gb(d.used_bytes),
+                format_gb(d.total_bytes),
+                d.ratio() * 100.0
+            ),
+            format_gb(d.available_bytes),
+            status,
+        ])
+        .style(style)
+    });
+
+    let table = Table::new(
+        table_rows,
+        [
+            Constraint::Min(18),
+            Constraint::Length(14),
+            Constraint::Length(26),
+            Constraint::Length(12),
+            Constraint::Length(18),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .title(format!(
+                " Диски ({}) • {} ",
+                disks.len(),
+                platform::cache_cleanup_hint()
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(C_GREEN)),
+    );
+    frame.render_widget(table, area);
 }
 
 fn render_cpu_box(frame: &mut Frame, app: &App, area: Rect) {
@@ -302,19 +434,21 @@ fn render_temp_net_box(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(widget, area);
 }
 
-fn render_disk_box(frame: &mut Frame, disk: &DiskStatus, area: Rect) {
-    let border_color = if disk.low_space {
-        C_RED
-    } else if !disk.mounted {
-        FG_MUTED
+fn render_disk_box(frame: &mut Frame, disk: &DiskStatus, low_space_gb: u64, area: Rect) {
+    let border_color = if disk.low_space { C_RED } else { C_GREEN };
+
+    let kind_badge = if disk.disk_kind.is_empty() {
+        disk.fs_type.clone()
     } else {
-        C_GREEN
+        format!("{} • {}", disk.disk_kind, disk.fs_type)
     };
 
     let title = if disk.low_space {
-        format!(" {} — ⚠ МАЛО МЕСТА (<5 ГБ) ", disk.label)
+        format!(" {} [{}] — ⚠ МАЛО МЕСТА (<{low_space_gb} ГБ) ", disk.mount_point, kind_badge)
+    } else if disk.name.is_empty() {
+        format!(" {} [{}] ", disk.mount_point, kind_badge)
     } else {
-        format!(" {} [{}] ", disk.label, disk.fs_type)
+        format!(" {} ({}) [{}] ", disk.mount_point, disk.name, kind_badge)
     };
 
     let block = Block::default()
@@ -324,16 +458,6 @@ fn render_disk_box(frame: &mut Frame, disk: &DiskStatus, area: Rect) {
         .border_style(Style::default().fg(border_color));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    if !disk.mounted {
-        let p = Paragraph::new(format!(
-            "Раздел {} не примонтирован. Нажмите [c] для очистки кэша.",
-            disk.mount_point
-        ))
-        .style(Style::default().fg(FG_MUTED));
-        frame.render_widget(p, inner);
-        return;
-    }
 
     let sub = Layout::default()
         .direction(Direction::Vertical)
@@ -366,10 +490,7 @@ fn render_disk_box(frame: &mut Frame, disk: &DiskStatus, area: Rect) {
                 format!("Свободно: {}! ", format_gb(disk.available_bytes)),
                 Style::default().fg(C_RED).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                "Нажмите [c] — очистить paccache и ~/.cache",
-                Style::default().fg(C_YELLOW),
-            ),
+            Span::styled(platform::cache_cleanup_hint(), Style::default().fg(C_YELLOW)),
         ])
     } else {
         Line::from(vec![
@@ -377,7 +498,7 @@ fn render_disk_box(frame: &mut Frame, disk: &DiskStatus, area: Rect) {
                 format!("Свободно: {}  ", format_gb(disk.available_bytes)),
                 Style::default().fg(FG_MAIN),
             ),
-            Span::styled("[c] быстрая очистка кэша", Style::default().fg(FG_MUTED)),
+            Span::styled(platform::cache_cleanup_hint(), Style::default().fg(FG_MUTED)),
         ])
     };
     frame.render_widget(Paragraph::new(hint), sub[1]);
@@ -450,7 +571,6 @@ fn render_vibecode_tab(frame: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
         .split(area);
 
-    // Левая колонка: Харнессы
     app.areas.harnesses_area = cols[0];
     let harnesses_focused = app.vibe_section == VibeSection::Harnesses;
 
@@ -466,7 +586,7 @@ fn render_vibecode_tab(frame: &mut Frame, app: &mut App, area: Rect) {
                     .current_profile()
                     .map(|p| p.profile_dir.as_str())
                     .filter(|s| !s.is_empty())
-                    .unwrap_or("xdg-open");
+                    .unwrap_or_else(|| platform::url_opener_label());
                 Span::styled(
                     format!(" [Профиль: {prof} | {model}]"),
                     Style::default().fg(C_TEAL),
@@ -474,18 +594,22 @@ fn render_vibecode_tab(frame: &mut Frame, app: &mut App, area: Rect) {
             } else if h.installed {
                 Span::styled(" [Установлен]", Style::default().fg(C_GREEN))
             } else {
-                Span::styled(" [Не установлен — Enter установит]", Style::default().fg(C_YELLOW))
+                Span::styled(
+                    " [Не установлен — Enter запросит установку]",
+                    Style::default().fg(C_YELLOW),
+                )
             };
 
+            let cfg_display = h.config_path_display();
             let provider_info = if h.kind == HarnessKind::NetlifyAi {
                 "Без API-ключа • [e]/ПКМ: модель и Google-профиль • [h]: Handoff".to_string()
             } else if let Some(saved) = app.config.harnesses.get(h.id) {
                 format!(
-                    "Провайдер: {} • Модель: {} • {}",
-                    saved.provider, saved.model, h.config_path_display
+                    "Провайдер: {} • Модель: {} • {cfg_display}",
+                    saved.provider, saved.model
                 )
             } else {
-                format!("{} • {}", h.description, h.config_path_display)
+                format!("{} • {cfg_display}", h.description)
             };
 
             ListItem::new(vec![
@@ -525,7 +649,6 @@ fn render_vibecode_tab(frame: &mut Frame, app: &mut App, area: Rect) {
 
     frame.render_stateful_widget(harness_list, cols[0], &mut app.harness_state);
 
-    // Правая колонка: Веб-чаты + Карточка быстрого Handoff
     let right_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -533,6 +656,7 @@ fn render_vibecode_tab(frame: &mut Frame, app: &mut App, area: Rect) {
 
     app.areas.webchats_area = right_rows[0];
     let web_focused = app.vibe_section == VibeSection::WebChats;
+    let opener = platform::url_opener_label();
 
     let chat_items: Vec<ListItem> = app
         .web_chats
@@ -544,7 +668,7 @@ fn render_vibecode_tab(frame: &mut Frame, app: &mut App, area: Rect) {
                         format!(" {}", c.name),
                         Style::default().fg(C_BLUE).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled("  ↗ xdg-open", Style::default().fg(FG_MUTED)),
+                    Span::styled(format!("  ↗ {opener}"), Style::default().fg(FG_MUTED)),
                 ]),
                 Line::from(Span::styled(
                     format!("   {}", c.description),
@@ -575,7 +699,6 @@ fn render_vibecode_tab(frame: &mut Frame, app: &mut App, area: Rect) {
 
     frame.render_stateful_widget(chat_list, right_rows[0], &mut app.webchat_state);
 
-    // Карточка Netlify AI & Handoff
     let active_model = app.config.netlify_ai.current_model();
     let active_profile = app
         .config
@@ -602,7 +725,7 @@ fn render_vibecode_tab(frame: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(FG_MAIN),
         )),
         Line::from(Span::styled(
-            "в ./.zipctl_handoff.md и буфер (wl-copy)",
+            format!("в ./.zipctl_handoff.md и буфер ({})", platform::clipboard_label()),
             Style::default().fg(C_GREEN),
         )),
         Line::from(Span::styled(
@@ -622,15 +745,180 @@ fn render_vibecode_tab(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(handoff_card, right_rows[1]);
 }
 
+fn render_git_services_tab(frame: &mut Frame, app: &mut App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(area);
+
+    // Левая колонка: Git Radar
+    app.areas.git_area = cols[0];
+    let git_focused = app.ops_section == OpsSection::Git;
+    let git_title = format!(
+        " Git Radar ({}) — [Enter/g] push • [o] папка ",
+        app.config.projects_dir
+    );
+    let git_block = Block::default()
+        .title(git_title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if git_focused { C_BLUE } else { FG_MUTED }));
+
+    if app.repos_loading && app.repos.is_empty() {
+        let p = Paragraph::new("Сканирование Git-репозиториев в фоне...")
+            .style(Style::default().fg(C_YELLOW))
+            .block(git_block);
+        frame.render_widget(p, cols[0]);
+    } else if let Some(ref err) = app.repos_error {
+        let p = Paragraph::new(format!(
+            "{err}\n\nИзмените параметр projects_dir в:\n{}",
+            zipctl_config_path().display()
+        ))
+        .style(Style::default().fg(C_YELLOW))
+        .wrap(Wrap { trim: true })
+        .block(git_block);
+        frame.render_widget(p, cols[0]);
+    } else if app.repos.is_empty() {
+        let p = Paragraph::new(format!(
+            "В каталоге «{}» не найдено Git-репозиториев.",
+            app.config.projects_dir
+        ))
+        .style(Style::default().fg(FG_MUTED))
+        .wrap(Wrap { trim: true })
+        .block(git_block);
+        frame.render_widget(p, cols[0]);
+    } else {
+        let repo_items: Vec<ListItem> = app
+            .repos
+            .iter()
+            .map(|r| {
+                let state_span = if r.is_dirty() {
+                    Span::styled(
+                        format!(" [изм: {}]", r.changed_count),
+                        Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::styled(" [чисто]", Style::default().fg(C_GREEN))
+                };
+                let sync = if r.ahead > 0 || r.behind > 0 {
+                    format!(" ↑{} ↓{}", r.ahead, r.behind)
+                } else {
+                    String::new()
+                };
+                let commit_line = if r.last_commit.is_empty() {
+                    "—".to_string()
+                } else {
+                    r.last_commit.clone()
+                };
+
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(
+                            format!(" {} ", r.name),
+                            Style::default().fg(FG_MAIN).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(format!("({})", r.branch), Style::default().fg(C_MAUVE)),
+                        Span::styled(sync, Style::default().fg(C_TEAL)),
+                        state_span,
+                    ]),
+                    Line::from(Span::styled(
+                        format!("   {commit_line}"),
+                        Style::default().fg(FG_MUTED),
+                    )),
+                ])
+            })
+            .collect();
+
+        let list = List::new(repo_items)
+            .block(git_block)
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(49, 50, 68))
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶");
+        frame.render_stateful_widget(list, cols[0], &mut app.repo_state);
+    }
+
+    // Правая колонка: Сервисы (systemd на Linux / sc.exe на Windows)
+    app.areas.services_area = cols[1];
+    let svc_focused = app.ops_section == OpsSection::Services;
+    let svc_title = format!(
+        " Сервисы ({}) — [Enter/Space] вкл/выкл • [R] рестарт ",
+        platform::services_manager_label()
+    );
+    let svc_block = Block::default()
+        .title(svc_title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if svc_focused { C_TEAL } else { FG_MUTED }));
+
+    if app.services_loading && app.services.is_empty() {
+        let p = Paragraph::new("Опрос состояния служб в фоне...")
+            .style(Style::default().fg(C_YELLOW))
+            .block(svc_block);
+        frame.render_widget(p, cols[1]);
+    } else if app.services.is_empty() {
+        let p = Paragraph::new(format!(
+            "Список служб пуст. Настройте services в:\n{}",
+            zipctl_config_path().display()
+        ))
+        .style(Style::default().fg(FG_MUTED))
+        .wrap(Wrap { trim: true })
+        .block(svc_block);
+        frame.render_widget(p, cols[1]);
+    } else {
+        let svc_items: Vec<ListItem> = app
+            .services
+            .iter()
+            .map(|s| {
+                let state_color = match s.state {
+                    ServiceState::Active => C_GREEN,
+                    ServiceState::Activating => C_YELLOW,
+                    ServiceState::Failed => C_RED,
+                    ServiceState::Inactive | ServiceState::NotFound | ServiceState::Unknown => {
+                        FG_MUTED
+                    }
+                };
+                let auto_tag = if s.enabled { "auto" } else { "manual" };
+
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(
+                            format!(" {} ", s.name),
+                            Style::default().fg(FG_MAIN).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("[{}]", s.state.label()),
+                            Style::default().fg(state_color).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(format!(" ({auto_tag})"), Style::default().fg(FG_MUTED)),
+                    ]),
+                    Line::from(Span::styled(
+                        format!("   {}", s.description),
+                        Style::default().fg(FG_MUTED),
+                    )),
+                ])
+            })
+            .collect();
+
+        let list = List::new(svc_items)
+            .block(svc_block)
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(49, 50, 68))
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶");
+        frame.render_stateful_widget(list, cols[1], &mut app.service_state);
+    }
+}
+
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let status_color = if app.status_is_error { C_RED } else { C_GREEN };
     let line = Line::from(vec![
         Span::styled(
-            if app.status_is_error {
-                " ✖ "
-            } else {
-                " ● "
-            },
+            if app.status_is_error { " ✖ " } else { " ● " },
             Style::default().fg(status_color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(&app.status_msg, Style::default().fg(FG_MAIN)),
@@ -647,7 +935,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_api_modal(frame: &mut Frame, m: &ApiConfigModal) {
-    let area = centered_rect(72, 62, frame.area());
+    let area = centered_rect(76, 68, frame.area());
     frame.render_widget(Clear, area);
 
     let block = Block::default()
@@ -670,6 +958,7 @@ fn render_api_modal(frame: &mut Frame, m: &ApiConfigModal) {
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
+            Constraint::Length(2),
             Constraint::Min(2),
         ])
         .split(inner);
@@ -685,26 +974,107 @@ fn render_api_modal(frame: &mut Frame, m: &ApiConfigModal) {
     render_input_field(frame, rows[1], "Base URL", &m.base_url, m.active_field == 1);
     render_input_field(frame, rows[2], "Модель", &m.model, m.active_field == 2);
 
+    let key_label = match &m.existing_key_hint {
+        Some(masked) => format!("API-ключ (F2 — показать/скрыть; в файле: {masked})"),
+        None => "API-ключ (F2 — показать/скрыть)".to_string(),
+    };
     let masked_key = if m.show_key {
         m.api_key.clone()
     } else {
         "•".repeat(m.api_key.chars().count())
     };
-    render_input_field(
-        frame,
-        rows[3],
-        "API-ключ (F2 — показать/скрыть)",
-        &masked_key,
-        m.active_field == 3,
-    );
+    render_input_field(frame, rows[3], &key_label, &masked_key, m.active_field == 3);
+
+    let test_line = if m.testing {
+        Line::from(Span::styled(
+            " ⏳ Проверка подключения к API...",
+            Style::default().fg(C_YELLOW),
+        ))
+    } else if let Some(ref res) = m.test_result {
+        let color = if res.ok { C_GREEN } else { C_RED };
+        let icon = if res.ok { "✔" } else { "✖" };
+        Line::from(Span::styled(
+            format!(" {icon} {}", res.message),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(Span::styled(
+            " Нажмите F5 или Ctrl+T для проверки подключения (создаётся .bak перед сохранением).",
+            Style::default().fg(FG_MUTED),
+        ))
+    };
+    frame.render_widget(Paragraph::new(test_line), rows[4]);
 
     let hint = Paragraph::new(
-        "Tab / ↑↓ — переключение полей • ←/→ — пресет провайдера • Enter / Ctrl+S — сохранить в конфиг • Esc — отмена",
+        "Tab / ↑↓ — поля • ←/→ — пресет • F5 / Ctrl+T — тест API • Enter / Ctrl+S — сохранить (.bak создаётся автоматически) • Esc — отмена",
     )
     .alignment(Alignment::Center)
     .style(Style::default().fg(FG_MUTED))
     .wrap(Wrap { trim: true });
-    frame.render_widget(hint, rows[4]);
+    frame.render_widget(hint, rows[5]);
+}
+
+fn render_confirm_install_modal(frame: &mut Frame, m: &ConfirmInstallModal) {
+    let area = centered_rect(68, 44, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(format!(" Подтверждение установки — {} ", m.harness_name))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(C_YELLOW))
+        .style(Style::default().bg(BG_ACCENT));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Бинарник ", Style::default().fg(FG_MAIN)),
+            Span::styled(
+                &m.missing_binary,
+                Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" не найден в PATH.", Style::default().fg(FG_MAIN)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Будет выполнена интерактивная команда установки:",
+            Style::default().fg(FG_MUTED),
+        )),
+        Line::from(Span::styled(
+            format!("  $ {}", m.command_display),
+            Style::default().fg(C_TEAL).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "TUI временно передаст управление терминалу и вернётся после завершения.",
+            Style::default().fg(FG_MUTED),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                " [y] Выполнить установку ",
+                Style::default()
+                    .fg(BG_ACCENT)
+                    .bg(C_GREEN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("    "),
+            Span::styled(
+                " [N / Esc] Отмена ",
+                Style::default()
+                    .fg(BG_ACCENT)
+                    .bg(C_RED)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
+
+    let p = Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(p, inner);
 }
 
 fn render_netlify_modal(frame: &mut Frame, app: &App, m: &NetlifyConfigModal) {
@@ -737,13 +1107,11 @@ fn render_netlify_modal(frame: &mut Frame, app: &App, m: &NetlifyConfigModal) {
         app.config.netlify_ai.selected_model + 1,
         app.config.netlify_ai.models.len()
     );
-    render_input_field(
-        frame,
-        rows[0],
-        "Активная модель (←/→ выбор, список в ~/.config/zipctl/config.toml)",
-        &model_text,
-        m.active_field == 0,
+    let model_label = format!(
+        "Активная модель (←/→ выбор, список в {})",
+        zipctl_config_path().display()
     );
+    render_input_field(frame, rows[0], &model_label, &model_text, m.active_field == 0);
 
     let profile_text = if let Some(p) = app.config.netlify_ai.current_profile() {
         format!(
@@ -789,7 +1157,8 @@ fn render_handoff_modal(frame: &mut Frame, app: &App, m: &HandoffModal) {
     frame.render_widget(Clear, area);
 
     let title = format!(
-        " Передача контекста (./.zipctl_handoff.md + wl-copy) • Модель: {} ",
+        " Передача контекста (./.zipctl_handoff.md + {}) • Модель: {} ",
+        platform::clipboard_label(),
         app.config.netlify_ai.current_model()
     );
     let block = Block::default()
@@ -842,9 +1211,10 @@ fn render_handoff_modal(frame: &mut Frame, app: &App, m: &HandoffModal) {
         m.active_field == 3,
     );
 
-    let hint = Paragraph::new(
-        "Tab / ↑↓ — переключение полей • Ctrl+S или Enter на последнем поле — сохранить и скопировать в Wayland-буфер • Esc — отмена",
-    )
+    let hint = Paragraph::new(format!(
+        "Tab / ↑↓ — переключение полей • Ctrl+S или Enter на последнем поле — сохранить и скопировать ({}) • Esc — отмена",
+        platform::clipboard_label()
+    ))
     .alignment(Alignment::Center)
     .style(Style::default().fg(FG_MUTED))
     .wrap(Wrap { trim: true });

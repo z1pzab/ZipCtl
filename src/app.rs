@@ -1,19 +1,25 @@
+use std::path::PathBuf;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::widgets::{ListState, TableState};
+use tokio::sync::mpsc;
 
-use zipctl::api_tester::{test_api_connection, ApiTestResult};
+use zipctl::api_tester::{test_api_connection_async, ApiTestResult};
 use zipctl::config_patcher::{
-    load_or_create_config, patch_harness_config, save_config, HarnessSavedConfig, ProviderPreset,
-    ZipCtlConfig,
+    detect_existing_api_key_masked, load_or_create_config, patch_harness_config, save_config,
+    HarnessSavedConfig, ProviderPreset, ZipCtlConfig,
 };
 use zipctl::git_radar::{quick_commit_and_push, scan_projects, RepoStatus};
 use zipctl::harnesses::{
-    default_harnesses, default_web_chats, launch_netlify_ai, launch_or_install_harness,
-    open_url_xdg, refresh_installed_flags, HandoffNote, HarnessDef, HarnessKind, WebChatDef,
+    default_harnesses, default_web_chats, launch_netlify_ai, refresh_installed_flags, HandoffNote,
+    HarnessDef, HarnessKind, WebChatDef,
 };
-use zipctl::services::{refresh_services, restart_service, toggle_service, ServiceStatus};
-use zipctl::sys::{trigger_cache_cleanup, SysMonitor};
+use zipctl::platform;
+use zipctl::services::{
+    refresh_services, restart_service, toggle_service, ServiceActionResult, ServiceStatus,
+};
+use zipctl::sys::SysMonitor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveTab {
@@ -35,6 +41,16 @@ pub enum OpsSection {
 }
 
 #[derive(Debug, Clone)]
+pub struct ForegroundCommand {
+    pub title: String,
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub pause_after: bool,
+    pub refresh_harnesses_after: bool,
+    pub refresh_services_after: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct ApiConfigModal {
     pub harness_id: String,
     pub harness_name: String,
@@ -43,8 +59,10 @@ pub struct ApiConfigModal {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
+    pub existing_key_hint: Option<String>,
     pub show_key: bool,
     pub active_field: usize, // 0: Provider, 1: Base URL, 2: Model, 3: API Key
+    pub testing: bool,
     pub test_result: Option<ApiTestResult>,
 }
 
@@ -61,11 +79,21 @@ pub struct HandoffModal {
 }
 
 #[derive(Debug, Clone)]
+pub struct ConfirmInstallModal {
+    pub harness_name: String,
+    pub missing_binary: String,
+    pub command_display: String,
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub enum Modal {
     None,
     ApiConfig(ApiConfigModal),
     NetlifyConfig(NetlifyConfigModal),
     Handoff(HandoffModal),
+    ConfirmInstall(ConfirmInstallModal),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -76,6 +104,21 @@ pub struct LayoutAreas {
     pub webchats_area: Rect,
     pub git_area: Rect,
     pub services_area: Rect,
+}
+
+#[derive(Debug)]
+pub enum BgEvent {
+    ReposLoaded(Result<Vec<RepoStatus>, String>),
+    ServicesLoaded(Vec<ServiceStatus>),
+    HarnessesChecked(Vec<HarnessDef>),
+    GitActionFinished(Result<String, String>),
+    ServiceActionFinished(ServiceActionResult),
+    ApiTestFinished {
+        harness_id: String,
+        result: ApiTestResult,
+    },
+    CacheCleaned(Result<String, String>),
+    HandoffSaved(Result<String, String>),
 }
 
 pub struct App {
@@ -89,7 +132,10 @@ pub struct App {
     pub web_chats: Vec<WebChatDef>,
     pub repos: Vec<RepoStatus>,
     pub repos_error: Option<String>,
+    pub repos_loading: bool,
     pub services: Vec<ServiceStatus>,
+    pub services_loading: bool,
+    pub cleanup_running: bool,
 
     pub process_state: TableState,
     pub harness_state: ListState,
@@ -101,19 +147,25 @@ pub struct App {
     pub status_msg: String,
     pub status_is_error: bool,
     pub areas: LayoutAreas,
+
+    pending_foreground: Option<ForegroundCommand>,
+    bg_tx: mpsc::UnboundedSender<BgEvent>,
+    bg_rx: mpsc::UnboundedReceiver<BgEvent>,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl App {
     pub fn new() -> Self {
-        let config = load_or_create_config();
+        let (config, config_warn) = load_or_create_config();
         let sys = SysMonitor::new(config.low_space_gb);
         let harnesses = default_harnesses();
         let web_chats = default_web_chats();
-        let (repos, repos_error) = match scan_projects(&config.projects_dir) {
-            Ok(list) => (list, None),
-            Err(err) => (Vec::new(), Some(err)),
-        };
-        let services = refresh_services(&config.services);
+        let (bg_tx, bg_rx) = mpsc::unbounded_channel();
 
         let mut process_state = TableState::default();
         if !sys.processes.is_empty() {
@@ -126,17 +178,17 @@ impl App {
         let mut webchat_state = ListState::default();
         webchat_state.select(Some(0));
 
-        let mut repo_state = ListState::default();
-        if !repos.is_empty() {
-            repo_state.select(Some(0));
-        }
+        let (status_msg, status_is_error) = if let Some(warn) = config_warn {
+            (warn, true)
+        } else {
+            (
+                "Готово. [Tab] вкладки • [h] Handoff • [r] обновить • [c] кэш • [q] выход"
+                    .to_string(),
+                false,
+            )
+        };
 
-        let mut service_state = ListState::default();
-        if !services.is_empty() {
-            service_state.select(Some(0));
-        }
-
-        Self {
+        let mut app = Self {
             should_quit: false,
             active_tab: ActiveTab::System,
             vibe_section: VibeSection::Harnesses,
@@ -145,25 +197,211 @@ impl App {
             sys,
             harnesses,
             web_chats,
-            repos,
-            repos_error,
-            services,
+            repos: Vec::new(),
+            repos_error: None,
+            repos_loading: true,
+            services: Vec::new(),
+            services_loading: true,
+            cleanup_running: false,
             process_state,
             harness_state,
             webchat_state,
-            repo_state,
-            service_state,
+            repo_state: ListState::default(),
+            service_state: ListState::default(),
             modal: Modal::None,
-            status_msg: "Готово. [Tab] вкладки • [h] Handoff • [g] Git Push • [c] кэш • [q] выход"
-                .to_string(),
-            status_is_error: false,
+            status_msg,
+            status_is_error,
             areas: LayoutAreas::default(),
-        }
+            pending_foreground: None,
+            bg_tx,
+            bg_rx,
+        };
+
+        app.spawn_refresh_repos();
+        app.spawn_refresh_services();
+        app
     }
 
     pub fn set_status(&mut self, msg: String, is_error: bool) {
         self.status_msg = msg;
         self.status_is_error = is_error;
+    }
+
+    pub fn take_pending_foreground(&mut self) -> Option<ForegroundCommand> {
+        self.pending_foreground.take()
+    }
+
+    pub fn on_foreground_finished(
+        &mut self,
+        fg: &ForegroundCommand,
+        result: Result<Option<i32>, String>,
+    ) {
+        match result {
+            Ok(Some(0)) | Ok(None) => {
+                self.set_status(format!("«{}» завершён.", fg.title), false);
+            }
+            Ok(Some(code)) => {
+                self.set_status(
+                    format!("«{}» завершился с кодом {code}.", fg.title),
+                    true,
+                );
+            }
+            Err(err) => self.set_status(format!("Ошибка запуска «{}»: {err}", fg.title), true),
+        }
+
+        if fg.refresh_harnesses_after {
+            self.spawn_refresh_harnesses();
+        }
+        if fg.refresh_services_after {
+            self.spawn_refresh_services();
+        }
+    }
+
+    pub fn drain_bg_events(&mut self) {
+        while let Ok(event) = self.bg_rx.try_recv() {
+            match event {
+                BgEvent::ReposLoaded(res) => {
+                    self.repos_loading = false;
+                    match res {
+                        Ok(list) => {
+                            self.repos = list;
+                            self.repos_error = None;
+                            if self.repos.is_empty() {
+                                self.repo_state.select(None);
+                            } else if self.repo_state.selected().is_none_or(|i| i >= self.repos.len())
+                            {
+                                self.repo_state.select(Some(0));
+                            }
+                        }
+                        Err(err) => {
+                            self.repos.clear();
+                            self.repos_error = Some(err);
+                            self.repo_state.select(None);
+                        }
+                    }
+                }
+                BgEvent::ServicesLoaded(list) => {
+                    self.services_loading = false;
+                    self.services = list;
+                    if self.services.is_empty() {
+                        self.service_state.select(None);
+                    } else if self
+                        .service_state
+                        .selected()
+                        .is_none_or(|i| i >= self.services.len())
+                    {
+                        self.service_state.select(Some(0));
+                    }
+                }
+                BgEvent::HarnessesChecked(list) => {
+                    self.harnesses = list;
+                    if self.harnesses.is_empty() {
+                        self.harness_state.select(None);
+                    } else if self
+                        .harness_state
+                        .selected()
+                        .is_none_or(|i| i >= self.harnesses.len())
+                    {
+                        self.harness_state.select(Some(0));
+                    }
+                }
+                BgEvent::GitActionFinished(res) => match res {
+                    Ok(msg) => {
+                        self.set_status(msg, false);
+                        self.spawn_refresh_repos();
+                    }
+                    Err(err) => self.set_status(err, true),
+                },
+                BgEvent::ServiceActionFinished(action_res) => match action_res {
+                    ServiceActionResult::Completed(Ok(msg)) => {
+                        self.set_status(msg, false);
+                        self.spawn_refresh_services();
+                    }
+                    ServiceActionResult::Completed(Err(err)) => {
+                        self.set_status(err, true);
+                        self.spawn_refresh_services();
+                    }
+                    ServiceActionResult::NeedsInteractive {
+                        program,
+                        args,
+                        title,
+                    } => {
+                        if let Some(exe) = platform::find_in_path(&program) {
+                            self.pending_foreground = Some(ForegroundCommand {
+                                title,
+                                program: exe,
+                                args,
+                                pause_after: true,
+                                refresh_harnesses_after: false,
+                                refresh_services_after: true,
+                            });
+                        } else {
+                            self.set_status(
+                                format!("Утилита «{program}» не найдена в PATH."),
+                                true,
+                            );
+                        }
+                    }
+                },
+                BgEvent::ApiTestFinished { harness_id, result } => {
+                    if let Modal::ApiConfig(ref mut m) = self.modal {
+                        if m.harness_id == harness_id {
+                            m.testing = false;
+                            m.test_result = Some(result);
+                        }
+                    }
+                }
+                BgEvent::CacheCleaned(res) => {
+                    self.cleanup_running = false;
+                    match res {
+                        Ok(msg) => {
+                            self.sys.refresh();
+                            self.set_status(msg, false);
+                        }
+                        Err(err) => self.set_status(err, true),
+                    }
+                }
+                BgEvent::HandoffSaved(res) => match res {
+                    Ok(msg) => self.set_status(msg, false),
+                    Err(err) => self.set_status(err, true),
+                },
+            }
+        }
+    }
+
+    pub fn spawn_refresh_repos(&mut self) {
+        self.repos_loading = true;
+        let tx = self.bg_tx.clone();
+        let dir = self.config.projects_dir.clone();
+        tokio::spawn(async move {
+            let res = scan_projects(dir).await;
+            let _ = tx.send(BgEvent::ReposLoaded(res));
+        });
+    }
+
+    pub fn spawn_refresh_services(&mut self) {
+        self.services_loading = true;
+        let tx = self.bg_tx.clone();
+        let names = self.config.services.clone();
+        tokio::spawn(async move {
+            let list = refresh_services(names).await;
+            let _ = tx.send(BgEvent::ServicesLoaded(list));
+        });
+    }
+
+    pub fn spawn_refresh_harnesses(&self) {
+        let tx = self.bg_tx.clone();
+        let mut current = self.harnesses.clone();
+        tokio::spawn(async move {
+            let updated = tokio::task::spawn_blocking(move || {
+                refresh_installed_flags(&mut current);
+                current
+            })
+            .await;
+            if let Ok(list) = updated {
+                let _ = tx.send(BgEvent::HarnessesChecked(list));
+            }
+        });
     }
 
     pub fn on_tick(&mut self) {
@@ -191,6 +429,7 @@ impl App {
             Modal::ApiConfig(_) => self.handle_api_modal_key(key),
             Modal::NetlifyConfig(_) => self.handle_netlify_modal_key(key),
             Modal::Handoff(_) => self.handle_handoff_modal_key(key),
+            Modal::ConfirmInstall(_) => self.handle_confirm_install_key(key),
         }
     }
 
@@ -212,10 +451,11 @@ impl App {
             KeyCode::Char('h') | KeyCode::Char('р') => self.open_handoff_modal(),
             KeyCode::Char('r') | KeyCode::Char('к') => {
                 self.sys.refresh();
-                refresh_installed_flags(&mut self.harnesses);
-                self.refresh_git_and_services();
+                self.spawn_refresh_harnesses();
+                self.spawn_refresh_repos();
+                self.spawn_refresh_services();
                 self.set_status(
-                    "Метрики, харнессы, Git-репозитории и сервисы обновлены.".to_string(),
+                    "Запущено фоновое обновление метрик, харнессов, Git и сервисов.".to_string(),
                     false,
                 );
             }
@@ -250,10 +490,19 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('c') | KeyCode::Char('с') => match trigger_cache_cleanup() {
-                Ok(msg) => self.set_status(msg, false),
-                Err(err) => self.set_status(err, true),
-            },
+            KeyCode::Char('c') | KeyCode::Char('с') => {
+                if self.cleanup_running {
+                    self.set_status("Очистка кэша уже выполняется в фоне...".to_string(), false);
+                    return;
+                }
+                self.cleanup_running = true;
+                self.set_status("Очистка кэша выполняется в фоне...".to_string(), false);
+                let tx = self.bg_tx.clone();
+                tokio::spawn(async move {
+                    let res = platform::cleanup_cache().await;
+                    let _ = tx.send(BgEvent::CacheCleaned(res));
+                });
+            }
             _ => {}
         }
     }
@@ -300,45 +549,33 @@ impl App {
             KeyCode::Char('g') | KeyCode::Char('п') => {
                 self.trigger_selected_git_push();
             }
+            KeyCode::Char('o') | KeyCode::Char('щ') if self.ops_section == OpsSection::Git => {
+                self.open_selected_repo_dir();
+            }
             KeyCode::Enter | KeyCode::Char(' ') => match self.ops_section {
                 OpsSection::Git => self.trigger_selected_git_push(),
                 OpsSection::Services => self.toggle_selected_service(),
             },
-            KeyCode::Char('R') | KeyCode::Char('К') => {
-                if self.ops_section == OpsSection::Services {
-                    self.restart_selected_service();
-                }
+            KeyCode::Char('R') | KeyCode::Char('К')
+                if self.ops_section == OpsSection::Services =>
+            {
+                self.restart_selected_service();
             }
             _ => {}
         }
     }
 
-    pub fn refresh_git_and_services(&mut self) {
-        match scan_projects(&self.config.projects_dir) {
-            Ok(list) => {
-                self.repos = list;
-                self.repos_error = None;
-                if self.repos.is_empty() {
-                    self.repo_state.select(None);
-                } else if self.repo_state.selected().is_none_or(|i| i >= self.repos.len()) {
-                    self.repo_state.select(Some(0));
-                }
-            }
-            Err(err) => {
-                self.repos.clear();
-                self.repos_error = Some(err);
-                self.repo_state.select(None);
-            }
-        }
-        self.services = refresh_services(&self.config.services);
-        if self.services.is_empty() {
-            self.service_state.select(None);
-        } else if self
-            .service_state
-            .selected()
-            .is_none_or(|i| i >= self.services.len())
-        {
-            self.service_state.select(Some(0));
+    fn open_selected_repo_dir(&mut self) {
+        let Some(idx) = self.repo_state.selected() else {
+            self.set_status("Нет выбранного Git-репозитория.".to_string(), true);
+            return;
+        };
+        let Some(repo) = self.repos.get(idx) else {
+            return;
+        };
+        match platform::open_path(&repo.path) {
+            Ok(msg) => self.set_status(msg, false),
+            Err(err) => self.set_status(err, true),
         }
     }
 
@@ -350,13 +587,15 @@ impl App {
         let Some(repo) = self.repos.get(idx).cloned() else {
             return;
         };
-        match quick_commit_and_push(&repo, None) {
-            Ok(msg) => {
-                self.refresh_git_and_services();
-                self.set_status(msg, false);
-            }
-            Err(err) => self.set_status(err, true),
-        }
+        self.set_status(
+            format!("Выполняется git add/commit/push для «{}»...", repo.name),
+            false,
+        );
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let res = quick_commit_and_push(repo, None).await;
+            let _ = tx.send(BgEvent::GitActionFinished(res));
+        });
     }
 
     fn toggle_selected_service(&mut self) {
@@ -366,13 +605,17 @@ impl App {
         let Some(svc) = self.services.get(idx).cloned() else {
             return;
         };
-        match toggle_service(&svc.name, svc.state.is_active()) {
-            Ok(msg) => {
-                self.services = refresh_services(&self.config.services);
-                self.set_status(msg, false);
-            }
-            Err(err) => self.set_status(err, true),
-        }
+        let action_word = if svc.state.is_active() {
+            "Остановка"
+        } else {
+            "Запуск"
+        };
+        self.set_status(format!("{action_word} службы «{}»...", svc.name), false);
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let res = toggle_service(svc.name, svc.state.is_active()).await;
+            let _ = tx.send(BgEvent::ServiceActionFinished(res));
+        });
     }
 
     fn restart_selected_service(&mut self) {
@@ -382,13 +625,12 @@ impl App {
         let Some(svc) = self.services.get(idx).cloned() else {
             return;
         };
-        match restart_service(&svc.name) {
-            Ok(msg) => {
-                self.services = refresh_services(&self.config.services);
-                self.set_status(msg, false);
-            }
-            Err(err) => self.set_status(err, true),
-        }
+        self.set_status(format!("Перезапуск службы «{}»...", svc.name), false);
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let res = restart_service(svc.name).await;
+            let _ = tx.send(BgEvent::ServiceActionFinished(res));
+        });
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -417,12 +659,10 @@ impl App {
                 match self.active_tab {
                     ActiveTab::System => {
                         if point_in_rect(col, row, self.areas.process_table_area) {
-                            // 1 border + 1 header row
                             let header_offset = self.areas.process_table_area.y + 2;
                             if row >= header_offset {
                                 let clicked = (row - header_offset) as usize;
-                                let offset = self.process_state.offset();
-                                let idx = offset + clicked;
+                                let idx = self.process_state.offset() + clicked;
                                 if idx < self.sys.processes.len() {
                                     self.process_state.select(Some(idx));
                                 }
@@ -434,7 +674,7 @@ impl App {
                             self.vibe_section = VibeSection::Harnesses;
                             let start_y = self.areas.harnesses_area.y + 1;
                             if row >= start_y {
-                                let idx = (row - start_y) as usize / 2;
+                                let idx = self.harness_state.offset() + (row - start_y) as usize / 2;
                                 if idx < self.harnesses.len() {
                                     self.harness_state.select(Some(idx));
                                     self.activate_selected_vibe_item();
@@ -444,7 +684,7 @@ impl App {
                             self.vibe_section = VibeSection::WebChats;
                             let start_y = self.areas.webchats_area.y + 1;
                             if row >= start_y {
-                                let idx = (row - start_y) as usize / 2;
+                                let idx = self.webchat_state.offset() + (row - start_y) as usize / 2;
                                 if idx < self.web_chats.len() {
                                     self.webchat_state.select(Some(idx));
                                     self.activate_selected_vibe_item();
@@ -457,7 +697,7 @@ impl App {
                             self.ops_section = OpsSection::Git;
                             let start_y = self.areas.git_area.y + 1;
                             if row >= start_y {
-                                let idx = (row - start_y) as usize / 2;
+                                let idx = self.repo_state.offset() + (row - start_y) as usize / 2;
                                 if idx < self.repos.len() {
                                     self.repo_state.select(Some(idx));
                                 }
@@ -466,7 +706,7 @@ impl App {
                             self.ops_section = OpsSection::Services;
                             let start_y = self.areas.services_area.y + 1;
                             if row >= start_y {
-                                let idx = (row - start_y) as usize / 2;
+                                let idx = self.service_state.offset() + (row - start_y) as usize / 2;
                                 if idx < self.services.len() {
                                     self.service_state.select(Some(idx));
                                     self.toggle_selected_service();
@@ -483,7 +723,7 @@ impl App {
                     self.vibe_section = VibeSection::Harnesses;
                     let start_y = self.areas.harnesses_area.y + 1;
                     if row >= start_y {
-                        let idx = (row - start_y) as usize / 2;
+                        let idx = self.harness_state.offset() + (row - start_y) as usize / 2;
                         if idx < self.harnesses.len() {
                             self.harness_state.select(Some(idx));
                             self.open_selected_harness_modal();
@@ -526,13 +766,39 @@ impl App {
                 let Some(harness) = self.harnesses.get(idx).cloned() else {
                     return;
                 };
-                let res = match harness.kind {
-                    HarnessKind::NetlifyAi => launch_netlify_ai(&self.config.netlify_ai),
-                    HarnessKind::Standard => launch_or_install_harness(&harness),
-                };
-                match res {
-                    Ok(msg) => self.set_status(msg, false),
-                    Err(err) => self.set_status(err, true),
+                match harness.kind {
+                    HarnessKind::NetlifyAi => match launch_netlify_ai(&self.config.netlify_ai) {
+                        Ok(msg) => self.set_status(msg, false),
+                        Err(err) => self.set_status(err, true),
+                    },
+                    HarnessKind::Standard => {
+                        if let Some(exe) = harness.active_binary() {
+                            self.pending_foreground = Some(ForegroundCommand {
+                                title: harness.name.to_string(),
+                                program: exe,
+                                args: Vec::new(),
+                                pause_after: false,
+                                refresh_harnesses_after: false,
+                                refresh_services_after: false,
+                            });
+                        } else if let Some(spec) = harness.install_spec() {
+                            self.modal = Modal::ConfirmInstall(ConfirmInstallModal {
+                                harness_name: harness.name.to_string(),
+                                missing_binary: harness.binary.to_string(),
+                                command_display: spec.display_string(),
+                                program: spec.program.to_string(),
+                                args: spec.args.iter().map(|s| (*s).to_string()).collect(),
+                            });
+                        } else {
+                            self.set_status(
+                                format!(
+                                    "Харнесс «{}» ({}) не найден в PATH, автоустановка для этой ОС не задана.",
+                                    harness.name, harness.binary
+                                ),
+                                true,
+                            );
+                        }
+                    }
                 }
             }
             VibeSection::WebChats => {
@@ -542,10 +808,53 @@ impl App {
                 let Some(chat) = self.web_chats.get(idx).cloned() else {
                     return;
                 };
-                match open_url_xdg(chat.url, chat.name) {
+                match platform::open_url(chat.url, chat.name) {
                     Ok(msg) => self.set_status(msg, false),
                     Err(err) => self.set_status(err, true),
                 }
+            }
+        }
+    }
+
+    fn handle_confirm_install_key(&mut self, key: KeyEvent) {
+        let Modal::ConfirmInstall(m) = std::mem::replace(&mut self.modal, Modal::None) else {
+            return;
+        };
+
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('д') | KeyCode::Char('Д') => {
+                if let Some(exe) = platform::find_in_path(&m.program) {
+                    self.pending_foreground = Some(ForegroundCommand {
+                        title: format!("Установка {}", m.harness_name),
+                        program: exe,
+                        args: m.args,
+                        pause_after: true,
+                        refresh_harnesses_after: true,
+                        refresh_services_after: false,
+                    });
+                } else {
+                    self.set_status(
+                        format!(
+                            "Не найден «{}» в PATH — не удалось выполнить «{}».",
+                            m.program, m.command_display
+                        ),
+                        true,
+                    );
+                }
+            }
+            KeyCode::Char('n')
+            | KeyCode::Char('N')
+            | KeyCode::Char('н')
+            | KeyCode::Char('Н')
+            | KeyCode::Esc
+            | KeyCode::Enter => {
+                self.set_status(
+                    format!("Установка «{}» отменена пользователем.", m.harness_name),
+                    false,
+                );
+            }
+            _ => {
+                self.modal = Modal::ConfirmInstall(m);
             }
         }
     }
@@ -576,17 +885,20 @@ impl App {
         let model = saved
             .map(|s| s.model.clone())
             .unwrap_or_else(|| provider.default_model(harness.id).to_string());
+        let existing_key_hint = detect_existing_api_key_masked(harness.id);
 
         self.modal = Modal::ApiConfig(ApiConfigModal {
             harness_id: harness.id.to_string(),
             harness_name: harness.name.to_string(),
-            config_path_display: harness.config_path_display.to_string(),
+            config_path_display: harness.config_path_display(),
             provider,
             base_url,
             model,
             api_key: String::new(),
+            existing_key_hint,
             show_key: false,
             active_field: 0,
+            testing: false,
             test_result: None,
         });
     }
@@ -596,6 +908,20 @@ impl App {
         self.modal = Modal::Handoff(HandoffModal {
             note,
             active_field: 0,
+        });
+    }
+
+    fn trigger_api_test(&self, m: &mut ApiConfigModal) {
+        m.testing = true;
+        m.test_result = None;
+        let tx = self.bg_tx.clone();
+        let harness_id = m.harness_id.clone();
+        let provider = m.provider;
+        let base_url = m.base_url.clone();
+        let api_key = m.api_key.clone();
+        tokio::spawn(async move {
+            let result = test_api_connection_async(provider, base_url, api_key).await;
+            let _ = tx.send(BgEvent::ApiTestFinished { harness_id, result });
         });
     }
 
@@ -622,10 +948,10 @@ impl App {
                 m.show_key = !m.show_key;
             }
             KeyCode::F(5) => {
-                m.test_result = Some(test_api_connection(m.provider, &m.base_url, &m.api_key));
+                self.trigger_api_test(&mut m);
             }
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                m.test_result = Some(test_api_connection(m.provider, &m.base_url, &m.api_key));
+                self.trigger_api_test(&mut m);
             }
             KeyCode::Left if m.active_field == 0 => {
                 m.provider = m.provider.prev();
@@ -686,7 +1012,7 @@ impl App {
             m.model.trim(),
             m.api_key.trim(),
         ) {
-            Ok(path) => {
+            Ok(res) => {
                 self.config.harnesses.insert(
                     m.harness_id.clone(),
                     HarnessSavedConfig {
@@ -696,11 +1022,16 @@ impl App {
                     },
                 );
                 let _ = save_config(&self.config);
+                let bak_info = res
+                    .backup_path
+                    .as_ref()
+                    .map(|b| format!(" • бэкап: {}", b.display()))
+                    .unwrap_or_default();
                 self.set_status(
                     format!(
-                        "Конфиг {} обновлён ({}) — провайдер: {}.",
+                        "Конфиг {} обновлён ({}) — провайдер: {}{bak_info}.",
                         m.harness_name,
-                        path.display(),
+                        res.path.display(),
                         m.provider.label()
                     ),
                     false,
@@ -892,10 +1223,15 @@ impl App {
             .map(|p| p.name.clone())
             .unwrap_or_else(|| "По умолчанию".to_string());
 
-        match m.note.save_and_copy(&model, &profile) {
-            Ok(msg) => self.set_status(msg, false),
-            Err(err) => self.set_status(err, true),
-        }
+        self.set_status(
+            "Сохранение Handoff и копирование в буфер обмена...".to_string(),
+            false,
+        );
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let res = m.note.save_and_copy(&model, &profile).await;
+            let _ = tx.send(BgEvent::HandoffSaved(res));
+        });
     }
 
     fn move_process_selection(&mut self, delta: isize) {

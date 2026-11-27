@@ -1,10 +1,9 @@
-use std::env;
 use std::fs;
-use std::io::Write;
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use crate::config_patcher::NetlifyAiConfig;
+use crate::config_patcher::{harness_config_path, NetlifyAiConfig};
+use crate::platform;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HarnessKind {
@@ -12,17 +11,73 @@ pub enum HarnessKind {
     NetlifyAi,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CommandSpec {
+    pub program: &'static str,
+    pub args: &'static [&'static str],
+}
+
+impl CommandSpec {
+    pub fn display_string(&self) -> String {
+        if self.args.is_empty() {
+            self.program.to_string()
+        } else {
+            format!("{} {}", self.program, self.args.join(" "))
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HarnessDef {
     pub id: &'static str,
     pub name: &'static str,
     pub binary: &'static str,
-    pub install_cmd: &'static str,
-    pub launch_cmd: &'static str,
-    pub config_path_display: &'static str,
+    pub alt_binaries: &'static [&'static str],
+    pub install_linux: Option<CommandSpec>,
+    pub install_windows: Option<CommandSpec>,
     pub description: &'static str,
     pub kind: HarnessKind,
     pub installed: bool,
+    pub resolved_binary: Option<PathBuf>,
+}
+
+impl HarnessDef {
+    pub fn install_spec(&self) -> Option<CommandSpec> {
+        #[cfg(target_os = "linux")]
+        {
+            self.install_linux
+        }
+        #[cfg(target_os = "windows")]
+        {
+            self.install_windows
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            self.install_linux.or(self.install_windows)
+        }
+    }
+
+    pub fn install_command_display(&self) -> Option<String> {
+        self.install_spec().map(|s| s.display_string())
+    }
+
+    pub fn active_binary(&self) -> Option<PathBuf> {
+        if let Some(p) = platform::find_in_path(self.binary) {
+            return Some(p);
+        }
+        for alt in self.alt_binaries {
+            if let Some(p) = platform::find_in_path(alt) {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    pub fn config_path_display(&self) -> String {
+        harness_config_path(self.id)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "—".to_string())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -40,84 +95,136 @@ pub struct HandoffNote {
     pub modified_files: String,
 }
 
+const NPM_CODEX: CommandSpec = CommandSpec {
+    program: "npm",
+    args: &["install", "-g", "@openai/codex"],
+};
+const NPM_CLAUDE: CommandSpec = CommandSpec {
+    program: "npm",
+    args: &["install", "-g", "@anthropic-ai/claude-code"],
+};
+const NPM_OPENCODE: CommandSpec = CommandSpec {
+    program: "npm",
+    args: &["install", "-g", "opencode-ai"],
+};
+const NPM_DEEPSEEK: CommandSpec = CommandSpec {
+    program: "npm",
+    args: &["install", "-g", "deepseek-cli"],
+};
+const NPM_ZCODE: CommandSpec = CommandSpec {
+    program: "npm",
+    args: &["install", "-g", "zcode-cli"],
+};
+const NPM_SUPERAGENT: CommandSpec = CommandSpec {
+    program: "npm",
+    args: &["install", "-g", "superagent-cli"],
+};
+const YAY_OPENCODE: CommandSpec = CommandSpec {
+    program: "yay",
+    args: &["-S", "opencode-bin"],
+};
+const YAY_ANTIGRAVITY: CommandSpec = CommandSpec {
+    program: "yay",
+    args: &["-S", "antigravity-bin"],
+};
+
 pub fn default_harnesses() -> Vec<HarnessDef> {
     let mut items = vec![
         HarnessDef {
-            id: "antigravity",
-            name: "Antigravity",
-            binary: "antigravity",
-            install_cmd: "yay -S --noconfirm antigravity-bin",
-            launch_cmd: "antigravity",
-            config_path_display: "~/.config/antigravity/config.json",
-            description: "Агентная среда разработки Google DeepMind",
+            id: "claude_code",
+            name: "Claude Code",
+            binary: "claude",
+            alt_binaries: &[],
+            install_linux: Some(NPM_CLAUDE),
+            install_windows: Some(NPM_CLAUDE),
+            description: "CLI-агент Anthropic Claude Code",
             kind: HarnessKind::Standard,
             installed: false,
+            resolved_binary: None,
         },
         HarnessDef {
             id: "codex",
             name: "Codex",
             binary: "codex",
-            install_cmd: "npm i -g @openai/codex",
-            launch_cmd: "codex",
-            config_path_display: "~/.codex/config.toml",
+            alt_binaries: &[],
+            install_linux: Some(NPM_CODEX),
+            install_windows: Some(NPM_CODEX),
             description: "CLI-агент OpenAI Codex",
             kind: HarnessKind::Standard,
             installed: false,
-        },
-        HarnessDef {
-            id: "claude_code",
-            name: "Claude Code",
-            binary: "claude",
-            install_cmd: "npm i -g @anthropic-ai/claude-code",
-            launch_cmd: "claude",
-            config_path_display: "~/.claude.json",
-            description: "CLI-агент Anthropic Claude Code",
-            kind: HarnessKind::Standard,
-            installed: false,
-        },
-        HarnessDef {
-            id: "deepseek_harness",
-            name: "DeepSeek Harness",
-            binary: "deepseek-cli",
-            install_cmd: "npm i -g deepseek-cli",
-            launch_cmd: "deepseek-cli",
-            config_path_display: "~/.config/deepseek-harness/config.toml",
-            description: "Терминальный агент для моделей DeepSeek",
-            kind: HarnessKind::Standard,
-            installed: false,
-        },
-        HarnessDef {
-            id: "superagent",
-            name: "SuperAgent",
-            binary: "superagent",
-            install_cmd: "npm i -g superagent-cli",
-            launch_cmd: "superagent",
-            config_path_display: "~/.config/superagent/config.json",
-            description: "Автономный мультимодельный CLI-харнесс",
-            kind: HarnessKind::Standard,
-            installed: false,
+            resolved_binary: None,
         },
         HarnessDef {
             id: "opencode",
             name: "OpenCode",
             binary: "opencode",
-            install_cmd: "yay -S --noconfirm opencode-bin",
-            launch_cmd: "opencode",
-            config_path_display: "~/.config/opencode/config.json",
+            alt_binaries: &[],
+            install_linux: Some(YAY_OPENCODE),
+            install_windows: Some(NPM_OPENCODE),
             description: "Открытый TUI-агент для разработки",
             kind: HarnessKind::Standard,
             installed: false,
+            resolved_binary: None,
+        },
+        HarnessDef {
+            id: "deepseek_harness",
+            name: "DeepAI Code (dsh)",
+            binary: "dsh",
+            alt_binaries: &["deepseek-cli"],
+            install_linux: Some(NPM_DEEPSEEK),
+            install_windows: Some(NPM_DEEPSEEK),
+            description: "Терминальный агент DeepAI / DeepSeek",
+            kind: HarnessKind::Standard,
+            installed: false,
+            resolved_binary: None,
+        },
+        HarnessDef {
+            id: "zcode",
+            name: "ZCode",
+            binary: "zcode",
+            alt_binaries: &[],
+            install_linux: Some(NPM_ZCODE),
+            install_windows: Some(NPM_ZCODE),
+            description: "Терминальный AI-ассистент zcode",
+            kind: HarnessKind::Standard,
+            installed: false,
+            resolved_binary: None,
+        },
+        HarnessDef {
+            id: "antigravity",
+            name: "Antigravity",
+            binary: "antigravity",
+            alt_binaries: &[],
+            install_linux: Some(YAY_ANTIGRAVITY),
+            install_windows: None,
+            description: "Агентная среда разработки Google DeepMind",
+            kind: HarnessKind::Standard,
+            installed: false,
+            resolved_binary: None,
+        },
+        HarnessDef {
+            id: "superagent",
+            name: "SuperAgent",
+            binary: "superagent",
+            alt_binaries: &[],
+            install_linux: Some(NPM_SUPERAGENT),
+            install_windows: Some(NPM_SUPERAGENT),
+            description: "Автономный мультимодельный CLI-харнесс",
+            kind: HarnessKind::Standard,
+            installed: false,
+            resolved_binary: None,
         },
         HarnessDef {
             id: "netlify_ai",
             name: "Netlify AI",
-            binary: "xdg-open",
-            install_cmd: "yay -S --noconfirm xdg-utils",
-            launch_cmd: "xdg-open https://app.netlify.com",
-            config_path_display: "~/.config/zipctl/config.toml",
+            binary: "browser",
+            alt_binaries: &[],
+            install_linux: None,
+            install_windows: None,
             description: "Смена Google-профиля, выбор модели и Handoff без API-ключа",
             kind: HarnessKind::NetlifyAi,
             installed: true,
+            resolved_binary: None,
         },
     ];
 
@@ -152,72 +259,18 @@ pub fn default_web_chats() -> Vec<WebChatDef> {
 
 pub fn refresh_installed_flags(harnesses: &mut [HarnessDef]) {
     for h in harnesses {
-        h.installed = match h.kind {
-            HarnessKind::NetlifyAi => true,
-            HarnessKind::Standard => which_exists(h.binary),
-        };
-    }
-}
-
-pub fn which_exists(bin: &str) -> bool {
-    if bin.contains('/') {
-        return Path::new(bin).is_file();
-    }
-    if let Ok(path_var) = env::var("PATH") {
-        for dir in env::split_paths(&path_var) {
-            let candidate = dir.join(bin);
-            if candidate.is_file() {
-                return true;
+        match h.kind {
+            HarnessKind::NetlifyAi => {
+                h.installed = true;
+                h.resolved_binary = None;
+            }
+            HarnessKind::Standard => {
+                let found = h.active_binary();
+                h.installed = found.is_some();
+                h.resolved_binary = found;
             }
         }
     }
-    false
-}
-
-pub fn launch_or_install_harness(harness: &HarnessDef) -> Result<String, String> {
-    if which_exists(harness.binary) {
-        spawn_in_kitty(
-            &format!("zipctl: {}", harness.name),
-            &format!("{}; exec ${{SHELL:-/bin/bash}}", harness.launch_cmd),
-        )?;
-        Ok(format!("Запущен «{}» в новом окне Kitty.", harness.name))
-    } else {
-        let install_script = format!(
-            "echo '=== Установка {} ==='; echo 'Команда: {}'; echo ''; {}; echo ''; read -rp 'Установка завершена. Нажмите Enter...'",
-            harness.name, harness.install_cmd, harness.install_cmd
-        );
-        spawn_in_kitty(&format!("Установка {}", harness.name), &install_script)?;
-        Ok(format!(
-            "Бинарник «{}» не найден — запущена установка ({}) в Kitty.",
-            harness.binary, harness.install_cmd
-        ))
-    }
-}
-
-pub fn spawn_in_kitty(title: &str, shell_cmd: &str) -> Result<(), String> {
-    if which_exists("kitty") {
-        Command::new("kitty")
-            .args(["--title", title, "sh", "-c", shell_cmd])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Ошибка запуска Kitty: {e}"))?;
-        Ok(())
-    } else {
-        Err("Терминал Kitty не найден в PATH. Установите пакет kitty.".to_string())
-    }
-}
-
-pub fn open_url_xdg(url: &str, label: &str) -> Result<String, String> {
-    Command::new("xdg-open")
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Не удалось открыть {label} через xdg-open: {e}"))?;
-    Ok(format!("Открыт {label} ({url}) через xdg-open."))
 }
 
 pub fn launch_netlify_ai(cfg: &NetlifyAiConfig) -> Result<String, String> {
@@ -232,31 +285,34 @@ pub fn launch_netlify_ai(cfg: &NetlifyAiConfig) -> Result<String, String> {
         let browser = profile.browser.trim();
         let dir = profile.profile_dir.trim();
 
-        if browser != "xdg-open" && !browser.is_empty() && which_exists(browser) {
-            let mut cmd = Command::new(browser);
-            if browser.contains("firefox") || browser.contains("zen") || browser.contains("librewolf")
-            {
-                if !dir.is_empty() {
-                    cmd.args(["-P", dir]);
+        if browser != "xdg-open" && browser != "default" && !browser.is_empty() {
+            if let Some(browser_exe) = platform::find_in_path(browser) {
+                let mut cmd = Command::new(browser_exe);
+                let lower = browser.to_ascii_lowercase();
+                if lower.contains("firefox") || lower.contains("zen") || lower.contains("librewolf")
+                {
+                    if !dir.is_empty() {
+                        cmd.args(["-P", dir]);
+                    }
+                } else if !dir.is_empty() {
+                    cmd.arg(format!("--profile-directory={dir}"));
                 }
-            } else if !dir.is_empty() {
-                cmd.arg(format!("--profile-directory={dir}"));
-            }
-            cmd.arg(url)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|e| format!("Ошибка запуска браузера {browser}: {e}"))?;
+                cmd.arg(url)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|e| format!("Ошибка запуска браузера {browser}: {e}"))?;
 
-            return Ok(format!(
-                "Netlify AI открыт в профиле «{}» (модель: {model}).",
-                profile.name
-            ));
+                return Ok(format!(
+                    "Netlify AI открыт в профиле «{}» (модель: {model}).",
+                    profile.name
+                ));
+            }
         }
     }
 
-    open_url_xdg(url, &format!("Netlify AI (модель: {model})"))
+    platform::open_url(url, &format!("Netlify AI (модель: {model})"))
 }
 
 impl HandoffNote {
@@ -346,13 +402,19 @@ impl HandoffNote {
         )
     }
 
-    pub fn save_and_copy(&self, active_model: &str, active_profile: &str) -> Result<String, String> {
+    pub async fn save_and_copy(
+        &self,
+        active_model: &str,
+        active_profile: &str,
+    ) -> Result<String, String> {
         let md = self.render_markdown(active_model, active_profile);
-        fs::write(Self::FILE_NAME, &md)
+        let md_for_write = md.clone();
+        tokio::task::spawn_blocking(move || fs::write(Self::FILE_NAME, md_for_write))
+            .await
+            .map_err(|e| format!("Ошибка записи {}: {e}", Self::FILE_NAME))?
             .map_err(|e| format!("Не удалось записать {}: {e}", Self::FILE_NAME))?;
 
-        let clip_status = copy_to_wayland_clipboard(&md);
-        match clip_status {
+        match platform::copy_to_clipboard(md).await {
             Ok(tool) => Ok(format!(
                 "Заметка сохранена в ./{} и скопирована в буфер ({tool}).",
                 Self::FILE_NAME
@@ -365,39 +427,17 @@ impl HandoffNote {
     }
 }
 
-fn copy_to_wayland_clipboard(text: &str) -> Result<&'static str, String> {
-    if which_exists("wl-copy") {
-        let mut child = Command::new("wl-copy")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("wl-copy: {e}"))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(text.as_bytes())
-                .map_err(|e| format!("wl-copy write: {e}"))?;
-        }
-        let _ = child.wait();
-        return Ok("wl-copy");
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if which_exists("xclip") {
-        let mut child = Command::new("xclip")
-            .args(["-selection", "clipboard"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("xclip: {e}"))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(text.as_bytes())
-                .map_err(|e| format!("xclip write: {e}"))?;
+    #[test]
+    fn no_harness_install_command_uses_noconfirm_or_sh_c() {
+        for h in default_harnesses() {
+            for spec in [h.install_linux, h.install_windows].into_iter().flatten() {
+                assert!(!spec.args.contains(&"--noconfirm"));
+                assert_ne!(spec.program, "sh");
+            }
         }
-        let _ = child.wait();
-        return Ok("xclip");
     }
-
-    Err("установите wl-clipboard".to_string())
 }

@@ -1,24 +1,21 @@
-use std::fs;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::collections::HashSet;
 use std::time::Instant;
 use sysinfo::{
-    Components, CpuRefreshKind, Disks, MemoryRefreshKind, Networks, Pid, ProcessRefreshKind,
-    ProcessesToUpdate, RefreshKind, System,
+    Components, CpuRefreshKind, DiskKind, Disks, MemoryRefreshKind, Networks, Pid,
+    ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
 };
 
-use crate::config_patcher::home_dir;
-use crate::harnesses::which_exists;
+use crate::platform;
 
 #[derive(Debug, Clone)]
 pub struct DiskStatus {
-    pub label: String,
+    pub name: String,
     pub mount_point: String,
+    pub disk_kind: String,
     pub total_bytes: u64,
     pub used_bytes: u64,
     pub available_bytes: u64,
     pub fs_type: String,
-    pub mounted: bool,
     pub low_space: bool,
 }
 
@@ -75,8 +72,7 @@ pub struct SysMonitor {
     pub tx_rate: f64,
     pub rx_total: u64,
     pub tx_total: u64,
-    pub root_disk: DiskStatus,
-    pub hdd_disk: DiskStatus,
+    pub disks_status: Vec<DiskStatus>,
     pub processes: Vec<ProcessInfo>,
     pub sort_mode: ProcessSort,
 }
@@ -98,7 +94,7 @@ impl SysMonitor {
             disks,
             networks,
             components,
-            low_space_bytes: low_space_gb * 1024 * 1024 * 1024,
+            low_space_bytes: low_space_gb.saturating_mul(1024 * 1024 * 1024),
             last_refresh: Instant::now(),
             cpu_usage: 0.0,
             per_core_usage: Vec::new(),
@@ -112,13 +108,21 @@ impl SysMonitor {
             tx_rate: 0.0,
             rx_total: 0,
             tx_total: 0,
-            root_disk: unmounted_disk("SSD / (60 ГБ)", "/"),
-            hdd_disk: unmounted_disk("HDD /mnt/hdd (500 ГБ)", "/mnt/hdd"),
+            disks_status: Vec::new(),
             processes: Vec::new(),
             sort_mode: ProcessSort::Cpu,
         };
         monitor.refresh();
         monitor
+    }
+
+    pub fn low_space_gb(&self) -> u64 {
+        self.low_space_bytes / (1024 * 1024 * 1024)
+    }
+
+    pub fn set_low_space_gb(&mut self, gb: u64) {
+        self.low_space_bytes = gb.saturating_mul(1024 * 1024 * 1024);
+        self.refresh_disks();
     }
 
     pub fn refresh(&mut self) {
@@ -183,10 +187,10 @@ impl SysMonitor {
         }
 
         if cpu_t.is_none() {
-            cpu_t = read_thermal_zone_fallback();
+            cpu_t = platform::read_cpu_temp_fallback();
         }
         if gpu_t.is_none() {
-            gpu_t = read_drm_gpu_temp_fallback();
+            gpu_t = platform::read_gpu_temp_fallback();
         }
 
         self.cpu_temp = cpu_t;
@@ -200,7 +204,7 @@ impl SysMonitor {
         let mut tx_tot: u64 = 0;
 
         for (iface, data) in &self.networks {
-            if iface == "lo" {
+            if iface == "lo" || iface.to_lowercase().contains("loopback") {
                 continue;
             }
             rx_delta = rx_delta.saturating_add(data.received());
@@ -216,29 +220,59 @@ impl SysMonitor {
     }
 
     fn refresh_disks(&mut self) {
-        self.root_disk = self.find_disk("SSD / (60 ГБ)", "/");
-        self.hdd_disk = self.find_disk("HDD /mnt/hdd (500 ГБ)", "/mnt/hdd");
-    }
+        let mut seen_mounts = HashSet::new();
+        let mut list = Vec::new();
 
-    fn find_disk(&self, label: &str, mount: &str) -> DiskStatus {
         for disk in &self.disks {
-            if disk.mount_point() == Path::new(mount) {
-                let total = disk.total_space();
-                let available = disk.available_space();
-                let used = total.saturating_sub(available);
-                return DiskStatus {
-                    label: label.to_string(),
-                    mount_point: mount.to_string(),
-                    total_bytes: total,
-                    used_bytes: used,
-                    available_bytes: available,
-                    fs_type: disk.file_system().to_string_lossy().into_owned(),
-                    mounted: true,
-                    low_space: available < self.low_space_bytes,
-                };
+            let total = disk.total_space();
+            if total == 0 {
+                continue;
             }
+
+            let fs_type = disk.file_system().to_string_lossy().trim().to_string();
+            if is_virtual_filesystem(&fs_type) {
+                continue;
+            }
+
+            let mount = disk.mount_point().to_string_lossy().into_owned();
+            if mount.is_empty() || !seen_mounts.insert(mount.clone()) {
+                continue;
+            }
+
+            let available = disk.available_space();
+            let used = total.saturating_sub(available);
+            let disk_kind = match disk.kind() {
+                DiskKind::SSD => "SSD".to_string(),
+                DiskKind::HDD => "HDD".to_string(),
+                DiskKind::Unknown(_) => String::new(),
+            };
+            let name = disk.name().to_string_lossy().trim().to_string();
+
+            list.push(DiskStatus {
+                name,
+                mount_point: mount,
+                disk_kind,
+                total_bytes: total,
+                used_bytes: used,
+                available_bytes: available,
+                fs_type: if fs_type.is_empty() {
+                    "—".to_string()
+                } else {
+                    fs_type
+                },
+                low_space: available < self.low_space_bytes,
+            });
         }
-        unmounted_disk(label, mount)
+
+        list.sort_by(|a, b| {
+            let a_root = is_primary_mount(&a.mount_point);
+            let b_root = is_primary_mount(&b.mount_point);
+            b_root
+                .cmp(&a_root)
+                .then_with(|| a.mount_point.to_lowercase().cmp(&b.mount_point.to_lowercase()))
+        });
+
+        self.disks_status = list;
     }
 
     fn refresh_processes(&mut self) {
@@ -306,108 +340,46 @@ impl SysMonitor {
     }
 }
 
-pub fn trigger_cache_cleanup() -> Result<String, String> {
-    if which_exists("kitty") {
-        let script = concat!(
-            "echo '=== Очистка кэша пакетов Arch Linux (paccache -rk1) ==='; ",
-            "if command -v paccache >/dev/null 2>&1; then ",
-            "  sudo paccache -rk1 || true; ",
-            "else ",
-            "  echo 'paccache не найден (установите pacman-contrib)'; ",
-            "fi; ",
-            "echo ''; ",
-            "echo '=== Очистка пользовательского кэша (~/.cache) ==='; ",
-            "BEFORE=$(du -sh \"$HOME/.cache\" 2>/dev/null | cut -f1); ",
-            "find \"$HOME/.cache\" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true; ",
-            "echo \"Очищено ~/.cache (было: ${BEFORE:-0})\"; ",
-            "echo ''; ",
-            "read -rp 'Готово! Нажмите Enter для закрытия...'"
-        );
-
-        Command::new("kitty")
-            .args(["--title", "zipctl: Очистка кэша", "sh", "-c", script])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Не удалось запустить Kitty: {e}"))?;
-
-        return Ok(
-            "Запущена очистка кэша (paccache -rk1 и ~/.cache) в новом окне Kitty.".to_string(),
-        );
-    }
-
-    // Резервный режим без Kitty: очищаем ~/.cache напрямую и запускаем paccache если доступно
-    let cache_dir = home_dir().join(".cache");
-    let mut removed = 0usize;
-    if let Ok(entries) = fs::read_dir(&cache_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let res = if path.is_dir() {
-                fs::remove_dir_all(&path)
-            } else {
-                fs::remove_file(&path)
-            };
-            if res.is_ok() {
-                removed += 1;
-            }
-        }
-    }
-
-    if which_exists("paccache") {
-        let _ = Command::new("paccache")
-            .arg("-rk1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-
-    Ok(format!(
-        "Очищено объектов в ~/.cache: {removed} (paccache -rk1 выполнен в фоне)."
-    ))
+fn is_primary_mount(mount: &str) -> bool {
+    mount == "/" || mount.eq_ignore_ascii_case("C:\\") || mount.eq_ignore_ascii_case("C:/")
 }
 
-fn unmounted_disk(label: &str, mount: &str) -> DiskStatus {
-    DiskStatus {
-        label: label.to_string(),
-        mount_point: mount.to_string(),
-        total_bytes: 0,
-        used_bytes: 0,
-        available_bytes: 0,
-        fs_type: "—".to_string(),
-        mounted: false,
-        low_space: false,
+/// Filters out Linux pseudo/virtual filesystems so only real partitions remain.
+pub fn is_virtual_filesystem(fs_type: &str) -> bool {
+    let lower = fs_type.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
     }
-}
-
-fn read_thermal_zone_fallback() -> Option<f32> {
-    let raw = fs::read_to_string("/sys/class/thermal/thermal_zone0/temp").ok()?;
-    let milli: f32 = raw.trim().parse().ok()?;
-    if milli > 1000.0 {
-        Some(milli / 1000.0)
-    } else {
-        Some(milli)
-    }
-}
-
-fn read_drm_gpu_temp_fallback() -> Option<f32> {
-    for card in 0..4 {
-        let hwmon_dir = format!("/sys/class/drm/card{card}/device/hwmon");
-        if let Ok(entries) = fs::read_dir(&hwmon_dir) {
-            for entry in entries.flatten() {
-                let temp_path = entry.path().join("temp1_input");
-                if let Ok(raw) = fs::read_to_string(temp_path) {
-                    if let Ok(milli) = raw.trim().parse::<f32>() {
-                        if milli > 1000.0 {
-                            return Some(milli / 1000.0);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+    matches!(
+        lower.as_str(),
+        "tmpfs"
+            | "devtmpfs"
+            | "efivarfs"
+            | "proc"
+            | "sysfs"
+            | "cgroup"
+            | "cgroup2"
+            | "overlay"
+            | "squashfs"
+            | "ramfs"
+            | "debugfs"
+            | "tracefs"
+            | "securityfs"
+            | "pstore"
+            | "autofs"
+            | "mqueue"
+            | "hugetlbfs"
+            | "fusectl"
+            | "configfs"
+            | "bpf"
+            | "nsfs"
+            | "devpts"
+            | "rpc_pipefs"
+            | "binfmt_misc"
+            | "fuse.portal"
+            | "fuse.gvfsd-fuse"
+            | "fuse.lxcfs"
+    )
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -440,5 +412,42 @@ pub fn format_rate(bytes_per_sec: f64) -> String {
         format!("{:.1} КБ/с", bytes_per_sec / KB)
     } else {
         format!("{:.0} Б/с", bytes_per_sec)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filters_linux_virtual_filesystems() {
+        for fs in ["tmpfs", "devtmpfs", "efivarfs", "proc", "sysfs", "TMPFS", "overlay"] {
+            assert!(is_virtual_filesystem(fs), "{fs} should be filtered");
+        }
+        for fs in ["ext4", "btrfs", "xfs", "NTFS", "vfat", "apfs"] {
+            assert!(!is_virtual_filesystem(fs), "{fs} should NOT be filtered");
+        }
+    }
+
+    #[test]
+    fn disk_ratio_is_clamped() {
+        let d = DiskStatus {
+            name: "System".to_string(),
+            mount_point: "/".to_string(),
+            disk_kind: "SSD".to_string(),
+            total_bytes: 100,
+            used_bytes: 40,
+            available_bytes: 60,
+            fs_type: "ext4".to_string(),
+            low_space: false,
+        };
+        assert!((d.ratio() - 0.4).abs() < f64::EPSILON);
+
+        let empty = DiskStatus {
+            total_bytes: 0,
+            used_bytes: 0,
+            ..d
+        };
+        assert_eq!(empty.ratio(), 0.0);
     }
 }
